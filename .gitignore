@@ -10,6 +10,10 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# IDE/editor metadata
+.idea/
+.vscode/
+
 # Practice output. `scripts/run_practice.py` writes here every run; nothing
 # in it is submitted and nothing in it should ever be committed.
 runs/

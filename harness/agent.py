@@ -153,6 +153,12 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
 
+# Real endpoints sometimes abstain before looking anything up. The prompt
+# addendum discourages that, but the agent can cheaply enforce one evidence
+# attempt without forging a claim: run a normal search through the tool stack
+# and give the model another turn.
+MAX_PREMATURE_FINAL_DEFERRALS = 1
+
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
 #: a dash, or an `<angle-bracket slot>`.
@@ -486,6 +492,7 @@ class ReActAgent:
         # `run()`; kept on the agent rather than in `ctx.state`, which
         # belongs to the layers.
         self._final_deferrals = 0
+        self._premature_final_deferrals = 0
         self._refused_final: dict | None = None
 
     # -- the run -------------------------------------------------------
@@ -502,6 +509,7 @@ class ReActAgent:
         )
         self.last_context = ctx
         self._final_deferrals = 0
+        self._premature_final_deferrals = 0
         self._refused_final = None
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
@@ -532,6 +540,13 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                if self._should_defer_premature_final(ctx, parsed.final):
+                    self._premature_final_deferrals += 1
+                    self._refused_final = parsed.final if isinstance(parsed.final, dict) else None
+                    observation = self._bootstrap_search(ctx)
+                    ctx.observations.append(observation)
+                    ctx.messages.append({"role": "user", "content": observation})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -659,6 +674,32 @@ class ReActAgent:
         result = call(parsed.tool, dict(parsed.args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+
+    def _should_defer_premature_final(self, ctx: AgentContext, report) -> bool:
+        """Give a premature no-evidence FINAL one chance to gather evidence."""
+        if self._premature_final_deferrals >= MAX_PREMATURE_FINAL_DEFERRALS:
+            return False
+        if not isinstance(report, dict) or not ctx.question:
+            return False
+        if ctx.tools.calls > 0 or ctx.observations:
+            return False
+        limit = ctx.max_tool_calls
+        if limit is not None and ctx.tools.calls >= limit - 1:
+            return False
+        claims = report.get("claims")
+        has_claim = any(
+            isinstance(claim, dict) and isinstance(claim.get("text"), str) and claim["text"].strip()
+            for claim in claims
+        ) if isinstance(claims, list) else False
+        return report.get("abstain") is True or not has_claim
+
+    def _bootstrap_search(self, ctx: AgentContext) -> str:
+        """Run the first search the model skipped, still through middleware."""
+        call = self.middleware.wrap_tool_call(ctx, self._dispatch)
+        result = call("search", {"query": ctx.question, "k": 5})
+        if result is None or not hasattr(result, "ok"):
+            return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho search"
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
